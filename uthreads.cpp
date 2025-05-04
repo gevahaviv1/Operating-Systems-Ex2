@@ -51,7 +51,7 @@ struct TCB {
       : tid(_tid),
         state(ThreadState::READY),
         entry(_entry),
-        stack(new char[STACK_SIZE]),
+        stack(nullptr),
         sleep_quanta(0),
         quantum_count(0)
     {
@@ -65,11 +65,11 @@ struct TCB {
         // compute new SP and PC into env
 
         if (entry){
+	    stack = new char[STACK_SIZE];
             address_t sp = (address_t) stack + STACK_SIZE - sizeof(address_t);
             address_t pc = (address_t) thread_trampoline;
             // platform-specific encoding
             env->__jmpbuf[JB_SP] = rot_xor(sp);
-            env->__jmpbuf[1] = rot_xor(sp);
             env->__jmpbuf[JB_PC] = rot_xor(pc);
             sigemptyset(&env->__saved_mask);
         }
@@ -78,7 +78,7 @@ struct TCB {
     ~TCB() {
         if (stack) {
             delete[] stack;
-            stack = nullptr;
+	    stack = nullptr;
         }
     }
 
@@ -176,6 +176,7 @@ class ThreadsManager {
         }
       }
       // it must be current
+
       delete current;
       switch_to_next(SwitchCause::TERMINATE);
       return 0;
@@ -271,11 +272,6 @@ class ThreadsManager {
     }
 
     void cleanup_all() {
- /*     if(current) {
-          delete current;
-          current = nullptr;
-      }*/
-
       for (auto* t: ready_queue){
           if(t) {delete t;}
       }
