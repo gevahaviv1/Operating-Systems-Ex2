@@ -6,9 +6,10 @@ EX: 1
 
 FILES:
 
-myfile.c -- a file with some code
-
-myfile.h -- a file with some headers
+- uthreads.cpp – Implementation of the user-level threads library
+- uthreads.h   – Header file for the library
+- Makefile     – Makefile with targets for build, clean, and tar
+- README       – This file
 
 REMARKS:
 
@@ -16,3 +17,66 @@ No remarks.
 
 ANSWERS:
 
+1.1 Siglongjmp and Sigsetjmp  
+------------------------------
+
+(a)  
+sigsetjmp(jmp_buf env, int save_sigmask) stores the calling thread’s complete execution context—program counter, stack pointer, and general CPU registers—in env.  
+When the program reaches the call normally, it returns 0. If siglongjmp is later called with the same buffer, the original sigsetjmp returns again, this time with the value passed to siglongjmp.
+
+siglongjmp(jmp_buf env, int val) restores the context saved by sigsetjmp, effectively "rewinding" execution back to the saved state. The call to siglongjmp does not return.
+
+(b)  
+If save_sigmask is non-zero in sigsetjmp, the current signal mask is saved as well.  
+When siglongjmp is used, this saved signal mask is restored too—reinstating the exact blocking state of signals.
+
+---
+
+1.2 General Use of User‑Level Thread  
+-------------------------------------
+
+Example use case: A high‑performance, event‑driven web server or a real‑time chat application with thousands of persistent connections.
+
+Why user-level threads? Because context switches between them are extremely cheap—they are done entirely in user space by saving/restoring a few registers and the stack pointer.
+
+---
+
+1.3 Advantages and Disadvantages of Creating a New Process  
+------------------------------------------------------------
+
+Advantages:  
+- Fault and security isolation: each process has its own address space.  
+- Robustness: if one tab crashes, others remain unaffected.  
+- OS-level scheduling and memory management.  
+
+Disadvantages:  
+- More overhead: each process uses more memory (stack, page tables).  
+- Slower context switches compared to threads (due to TLB flushes).  
+- Communication is harder—requires IPC instead of simple pointers.  
+
+---
+
+1.4 Interrupts and Signals  
+----------------------------
+
+Steps when the user types kill <pid>:
+
+1. Keyboard interrupt: Hardware interrupt triggers the kernel to read the key and pass it to the shell.  
+2. Shell processing: Parses the command and calls kill(2).  
+3. System call interrupt: Triggers a trap into the kernel via a software interrupt.  
+4. Signal to target: Kernel enqueues SIGTERM in the target’s pending signals.  
+5. Signal delivery: When scheduled, the process receives SIGTERM and is terminated (default behavior).  
+6. SIGCHLD to shell: Kernel sends SIGCHLD to the shell, which handles it via waitpid(2).  
+
+Result: one hardware interrupt (keyboard), one software interrupt (syscall), and two signals (SIGTERM, SIGCHLD).
+
+---
+
+1.5 Difference Between ‘Real’ and ‘Virtual’ Time  
+--------------------------------------------------
+
+Real time: Wall-clock time (advances regardless of the process state).  
+Example: alarm(10) aborts a connection if no response within 10 seconds.  
+
+Virtual time: Measures only user-mode CPU time of the process.  
+Example: Statistical profiling with ITIMER_VIRTUAL that samples CPU activity every 5ms of actual processing time.
