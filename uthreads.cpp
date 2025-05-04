@@ -324,16 +324,18 @@ class ThreadsManager {
           current->quantum_count++;
 
           // decrement sleepers & wake up
-          for (auto it = blocked_list.begin(); it!=blocked_list.end();) {
-              TCB* t = *it;
-              if (t->sleep_quanta>0 && --t->sleep_quanta==0 && t->state==ThreadState::BLOCKED){
-                  t->state = ThreadState::READY;
-                  ready_queue.push_back(t);
-                  it = blocked_list.erase(it);
-                  continue;
-              }
-              ++it;
-          }
+	  if (why == SwitchCause::CYCLE) {
+		  for (auto it = blocked_list.begin(); it!=blocked_list.end();) {
+		      TCB* t = *it;
+		      if (t->sleep_quanta>0 && --t->sleep_quanta==0 && t->state==ThreadState::BLOCKED){
+			  t->state = ThreadState::READY;
+			  ready_queue.push_back(t);
+			  it = blocked_list.erase(it);
+			  continue;
+		      }
+		      ++it;
+		  }
+	  }
 
           arm_timer();
           siglongjmp(current->env,1);
