@@ -340,16 +340,17 @@ class ThreadsManager {
     }
 };
 
-// the trampoline that actually calls the entry point
+// low-level trampoline we set PC to when a thread first runs
 static void thread_trampoline() {
-  auto& M = ThreadsManager::instance();
-  // find our TCB by looking at current tid
-  int tid = M.get_tid();
-  // jump into the real function
-  for (;;) {
-    // this never returns
-    throw std::logic_error("should not reach here");
-  }
+    auto& mgr = ThreadsManager::instance();
+    // grab the entry function for this thread
+    thread_entry_point func = mgr.current->entry;
+    // run the thread’s function (this will never return under normal use,
+    // but if it does, we must terminate the thread)
+    func();
+    // once the thread function returns, terminate this thread
+    uthread_terminate(mgr.get_tid());
+    // (never reached)
 }
 
 //
