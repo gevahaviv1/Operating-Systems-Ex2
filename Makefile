@@ -1,41 +1,26 @@
-# Define compiler and flags
 CXX = g++
-CXXFLAGS = -Wall -std=c++11 -I.
+CXXFLAGS = -std=c++11 -Wall -Wextra -pedantic
+AR = ar
+ARFLAGS = rcs
+RM = rm -f
 
-# Source files
-SRCS = uthreads.cpp
-HEADERS = uthreads.h
-OBJS = $(SRCS:.cpp=.o)
+LIB = libuthreads.a
+OBJS = uthreads.o
+HDRS = uthreads.h
+TARGET = $(LIB)
 
-# Static library name
-TARGET = libuthreads.a
+all: $(TARGET)
 
-# Test files
-TEST_DIR = test
-OUT_DIR = $(TEST_DIR)/out
-TEST_SRCS = $(wildcard $(TEST_DIR)/*.cpp)
-TEST_NAMES = $(notdir $(TEST_SRCS:.cpp=))
-TEST_BINS = $(addprefix $(OUT_DIR)/, $(TEST_NAMES))
+$(LIB): $(OBJS)
+	$(AR) $(ARFLAGS) $@ $^
 
-# Default target
-all: $(TARGET) $(OUT_DIR) $(TEST_BINS)
+uthreads.o: uthreads.cpp $(HDRS)
+	$(CXX) $(CXXFLAGS) -c uthreads.cpp
 
-# Create static library
-$(TARGET): $(OBJS)
-	ar rcs $@ $^
+.PHONY: clean tar
 
-# Create object files
-%.o: %.cpp $(HEADERS)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# Create output directory if it doesn't exist
-$(OUT_DIR):
-	mkdir -p $@
-
-# Compile and link each test
-$(OUT_DIR)/%: $(TEST_DIR)/%.cpp $(TARGET)
-	$(CXX) $(CXXFLAGS) $< $(TARGET) -o $@
-
-# Clean
 clean:
-	rm -f $(OBJS) $(TARGET) $(OUT_DIR)/*
+	$(RM) $(OBJS) $(LIB) ex2.tar
+
+tar: clean
+	tar -cvf ex2.tar uthreads.cpp uthreads.h Makefile README
