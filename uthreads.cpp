@@ -4,500 +4,370 @@
 #include <csignal>
 #include <csetjmp>
 #include <cstring>
-#include <cstdlib>
-#include <cstdio>
+#include <iostream>
+#include <deque>
+#include <list>
 #include <sys/time.h>
+#include <stdexcept>
 
-// Thread states.
-enum class ThreadState {RUNNING, READY, BLOCKED};
+#define JB_SP 6
+#define JB_PC 7
 
-// Define address.
-typedef unsigned long address_t;
+struct SigBlocker {
+    sigset_t oldmask;
+    SigBlocker() {
+        sigset_t m{};
+        sigemptyset(&m);
+        sigaddset(&m, SIGVTALRM);
+        if (sigprocmask(SIG_BLOCK, &m, &oldmask) < 0) {
+            std::perror("sigprocmask");
+            std::exit(1);
+        }
+    }
+    ~SigBlocker() {
+        sigprocmask(SIG_SETMASK, &oldmask, nullptr);
+    }
+};
 
-// Thread Control Block.
-struct ThreadControlBlock {
+enum class ThreadState { RUNNING, READY, BLOCKED };
+enum class SwitchCause { CYCLE, BLOCK, TERMINATE };
+
+using address_t = unsigned long;
+
+// low-level trampoline we set PC to when a thread first runs
+static void thread_trampoline();
+
+// one per thread
+struct TCB {
     int tid;
     ThreadState state;
     sigjmp_buf env;
-    thread_entry_point entry_point;
+    thread_entry_point entry;
     char* stack;
-    int sleep_count;
-    int quantums;
+    int sleep_quanta;
+    int quantum_count;
+
+    TCB(int _tid, thread_entry_point _entry)
+      : tid(_tid),
+        state(ThreadState::READY),
+        entry(_entry),
+        stack(new char[STACK_SIZE]),
+        sleep_quanta(0),
+        quantum_count(0)
+    {
+        // capture an initial context so we can poke SP and PC
+        if (sigsetjmp(env, 1) != 0) {
+            // never actually returns here
+            entry();
+            // if it ever falls through, terminate itself
+            uthread_terminate(tid);
+        }
+        // compute new SP and PC into env
+        address_t sp = (address_t)stack + STACK_SIZE - sizeof(address_t);
+        address_t pc = (address_t)thread_trampoline;
+        // platform-specific encoding
+        env->__jmpbuf[JB_SP] = rot_xor(sp);
+        env->__jmpbuf[JB_PC] = rot_xor(pc);
+        sigemptyset(&env->__saved_mask);
+    }
+
+    ~TCB() {
+        delete[] stack;
+    }
+
+    // cheap obfuscation of address so the kernel/jmpbuf trust it
+    static address_t rot_xor(address_t a) {
+        address_t r = a;
+        asm volatile(
+            "xor  %%fs:0x30, %0\n"
+            "rol  $0x11, %0\n"
+            : "=g"(r) : "0"(r)
+        );
+        return r;
+    }
 };
 
-// Private to this cpp file.
-static ThreadControlBlock* threads[MAX_THREAD_NUM] = {nullptr};
-static int current_tid = -1;
-static int total_threads = 0;
-static int quantum_usecs = 0;
-static int total_quantums = 0;
+// manages all threads
+class ThreadsManager {
+  public:
+    int              quantum_usecs{};
+    int              total_quanta{};
+    TCB*             current{};
+    std::deque<TCB*> ready_queue;
+    std::list<TCB*>  blocked_list;
+    bool             used_tid[MAX_THREAD_NUM]{};
 
-// Simple buffers for READY tids.
-static int ready_queue[MAX_THREAD_NUM];
-static int rq_head, rq_tail;
+    ThreadsManager() = default;
 
-// Forward declaration of scheduler handler (defined elsewhere).
-static void schedule_handler(int);
+    void init(int q_u) {
+      if (q_u <= 0) {
+        std::cerr << "thread library error: quantum must be positive\n";
+        throw std::runtime_error("bad quantum");
+      }
+      quantum_usecs = q_u;
+      total_quanta = 1;
 
-// Helper: push tid onto READY queue.
-static void enqueue_ready(int tid) {
-    ready_queue[rq_tail] = tid;
-    rq_tail = (rq_tail + 1) % MAX_THREAD_NUM;
-}
+      // main thread TCB
+      current = new TCB(0, nullptr);
+      current->state = ThreadState::RUNNING;
+      current->quantum_count = 1;
+      used_tid[0] = true;
 
-// Helper: dequeue the next tid (assumes queue is non-empty).
-static int dequeue_ready() {
-  int tid = ready_queue[rq_head];
-  rq_head = (rq_head + 1) % MAX_THREAD_NUM;
-  return tid;
-}
-
-// Returns the number of tids currently enqueued in ready_queue[].
-static int ready_size() {
-    if (rq_tail >= rq_head) {
-        // usual case: tail has not wrapped past head.
-        return rq_tail - rq_head;
-    }
-    // wrapped around: head > tail.
-    return rq_tail + MAX_THREAD_NUM - rq_head;
-}
-
-// ------------------------------------------------------------------
-// Helpers to block/unblock our virtual‐timer signal (SIGVTALRM)
-// ------------------------------------------------------------------
-static void block_timer(sigset_t &prev_mask) {
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGVTALRM);
-    if (sigprocmask(SIG_BLOCK, &mask, &prev_mask) < 0) {
-        std::perror("sigprocmask");
-        std::exit(1);
-    }
-}
-
-static void restore_timer(const sigset_t &prev_mask) {
-    if (sigprocmask(SIG_SETMASK, &prev_mask, nullptr) < 0) {
-        std::perror("sigprocmask");
-        std::exit(1);
-    }
-}
-
-// ------------------------------------------------------------------
-// Helper to remove a tid from the READY queue (if present)
-// ------------------------------------------------------------------
-static void remove_from_ready(int tid) {
-    int new_tail = 0;
-    int old_size = ready_size();
-    for (int i = 0; i < old_size; ++i) {
-	    int x = dequeue_ready();
-	    if (x != tid) {
-		    ready_queue[new_tail++] = x;
-		    new_tail %= MAX_THREAD_NUM;
-	    }
+      install_timer_handler();
+      arm_timer();
     }
 
-    // Reinstall new queue indices.
-    rq_head = 0;
-    rq_tail = new_tail;
-}
-
-// Initializes the thread library.
-int uthread_init(int q_usecs) {
-    // Validate quantum.
-    if (q_usecs <= 0) {
-        std::fprintf(stderr, "thread library error: quantum must be positive\n");
+    int spawn(thread_entry_point entry) {
+      SigBlocker block;
+      if (!entry) {
+        std::cerr << "thread library error: entry point null\n";
         return -1;
-    }
-    quantum_usecs = q_usecs;
-
-    // Block SIGVTALRM during setup.
-    sigset_t mask;
-    block_timer(mask);
-
-    // Create and register main thread (tid 0).
-    auto* main_tcb = new ThreadControlBlock;
-    if (!main_tcb) {
-        std::perror("malloc");
+      }
+      int tid = next_free_tid();
+      if (tid < 0) {
+        std::cerr << "thread library error: too many threads\n";
+        return -1;
+      }
+      used_tid[tid] = true;
+      TCB* t = nullptr;
+      try {
+        t = new TCB(tid, entry);
+      } catch (std::bad_alloc&) {
+        std::cerr << "system error: alloc failed\n";
         std::exit(1);
+      }
+      ready_queue.push_back(t);
+      return tid;
     }
-    main_tcb->tid = 0;
-    main_tcb->state = ThreadState::RUNNING;
-    main_tcb->entry_point = nullptr;
-    main_tcb->stack = nullptr;
-    main_tcb->sleep_count = 0;
-    main_tcb->quantums  = 1;
 
-    threads[0] = main_tcb;
-    total_threads = 1;
-    total_quantums = 1;
-    current_tid = 0;
+    int terminate(int tid) {
+      SigBlocker block;
+      if (tid < 0 || tid >= MAX_THREAD_NUM || !used_tid[tid]) {
+        std::cerr << "thread library error: bad tid\n";
+        return -1;
+      }
+      // kill everything
+      if (tid == 0) {
+        cleanup_all();
+        std::exit(0);
+      }
+      used_tid[tid] = false;
+      // remove from ready
+      for (auto it = ready_queue.begin(); it != ready_queue.end(); ++it) {
+        if ((*it)->tid == tid) {
+          delete *it;
+          ready_queue.erase(it);
+          return 0;
+        }
+      }
+      // remove from blocked
+      for (auto it = blocked_list.begin(); it != blocked_list.end(); ++it) {
+        if ((*it)->tid == tid) {
+          delete *it;
+          blocked_list.erase(it);
+          return 0;
+        }
+      }
+      // it must be current
+      delete current;
+      switch_to_next(SwitchCause::TERMINATE);
+      return 0;
+    }
 
-    // Save current context for thread 0.
-    if (sigsetjmp(main_tcb->env, 1) != 0) {
-        // When longjmp back here: resume main.
+    int block(int tid) {
+      SigBlocker block;
+      if (tid <= 0 || tid >= MAX_THREAD_NUM || !used_tid[tid]) {
+        std::cerr << "thread library error: cannot block\n";
+        return -1;
+      }
+      // find in ready
+      for (auto it = ready_queue.begin(); it != ready_queue.end(); ++it) {
+        if ((*it)->tid == tid) {
+          (*it)->state = ThreadState::BLOCKED;
+          blocked_list.push_back(*it);
+          ready_queue.erase(it);
+          return 0;
+        }
+      }
+      // maybe it's running
+      if (current->tid == tid) {
+        current->state = ThreadState::BLOCKED;
+        switch_to_next(SwitchCause::BLOCK);
         return 0;
+      }
+      return 0; // already blocked?
     }
 
-    // Install SIGVTALRM handler.
-    struct sigaction sa;
-    std::memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = &schedule_handler;
-    sa.sa_mask = mask; // Block SIGVTALRM inside handler.
-    if (sigaction(SIGVTALRM, &sa, nullptr) < 0) {
-        std::perror("sigaction");
-        std::exit(1);
+    int resume(int tid) {
+      SigBlocker block;
+      if (tid < 0 || tid >= MAX_THREAD_NUM || !used_tid[tid]) {
+        std::cerr << "thread library error: cannot resume\n";
+        return -1;
+      }
+      for (auto it = blocked_list.begin(); it != blocked_list.end(); ++it) {
+        if ((*it)->tid == tid) {
+          (*it)->state = ThreadState::READY;
+          ready_queue.push_back(*it);
+          blocked_list.erase(it);
+          return 0;
+        }
+      }
+      return 0;
     }
 
-    // Arm virtual timer for periodic SIGVTALRM.
-    struct itimerval timer;
-    timer.it_value.tv_sec = 0;
-    timer.it_value.tv_usec = quantum_usecs;
-    timer.it_interval = timer.it_value;
-    if (setitimer(ITIMER_VIRTUAL, &timer, nullptr) < 0) {
+    int sleep(int quantums) {
+      SigBlocker block;
+      if (quantums < 1 || current->tid == 0) {
+        std::cerr << "thread library error: bad sleep\n";
+        return -1;
+      }
+      current->sleep_quanta = quantums;
+      current->state = ThreadState::BLOCKED;
+      switch_to_next(SwitchCause::BLOCK);
+      return 0;
+    }
+
+    int get_tid()    const { return current->tid; }
+    int get_total()  const { return total_quanta; }
+    int get_quantum(int tid) const {
+      if (tid<0||tid>=MAX_THREAD_NUM||!used_tid[tid]) {
+        std::cerr<<"thread library error\n"; return -1;
+      }
+      if (tid==current->tid) return current->quantum_count;
+      for (auto* t: ready_queue) if (t->tid==tid) return t->quantum_count;
+      for (auto* t: blocked_list) if (t->tid==tid) return t->quantum_count;
+      return -1;
+    }
+
+  private:
+    void install_timer_handler() {
+      struct sigaction sa{};
+      sa.sa_handler = +[](int){ ThreadsManager::instance().on_timer(); };
+      sigaction(SIGVTALRM, &sa, nullptr);
+    }
+
+    void arm_timer() {
+      struct itimerval tv{};
+      tv.it_value.tv_sec  = quantum_usecs/1000000;
+      tv.it_value.tv_usec = quantum_usecs%1000000;
+      tv.it_interval      = tv.it_value;
+      if (setitimer(ITIMER_VIRTUAL,&tv,nullptr)<0) {
         std::perror("setitimer");
         std::exit(1);
+      }
     }
 
-    // Initialize empty READY queue.
-    rq_head = rq_tail = 0;
+    int next_free_tid() const {
+      for (int i=1; i<MAX_THREAD_NUM; ++i)
+        if (!used_tid[i]) return i;
+      return -1;
+    }
 
-    // Unblock SIGVTALRM now that we’re ready.
-    restore_timer(mask);
+    void cleanup_all() {
+      delete current;
+      for (auto* t: ready_queue)  delete t;
+      for (auto* t: blocked_list) delete t;
+    }
 
-    return 0;
-}
+    // called on each SIGVTALRM
+    void on_timer() {
+      SigBlocker block;
 
-static void schedule_handler(int /*unused*/) {
-    // Stop further SIGVTALRM while we rearrange.
-    sigset_t prev;
-    block_timer(prev);
-
-    // Wake any sleeping threads whose countdown just reached zero.
-    for (int i = 0; i < MAX_THREAD_NUM; ++i) {
-        auto* t = threads[i];
-        if (t && t->state == ThreadState::BLOCKED && t->sleep_count > 0) {
-            if (--t->sleep_count == 0) {
-                // time to wake!
-                t->state = ThreadState::READY;
-                enqueue_ready(t->tid);
-            }
+      // decrement sleepers & wake up
+      for (auto it = blocked_list.begin(); it!=blocked_list.end();) {
+        TCB* t = *it;
+        if (t->sleep_quanta>0 && --t->sleep_quanta==0 && t->state==ThreadState::BLOCKED){
+          t->state = ThreadState::READY;
+          ready_queue.push_back(t);
+          it = blocked_list.erase(it);
+          continue;
         }
+        ++it;
+      }
+
+      // preempt current if it's still RUNNING
+      if (current->state==ThreadState::RUNNING) {
+        switch_to_next(SwitchCause::CYCLE);
+      }
     }
 
-    // Preempt current running thread.
-    ThreadControlBlock* me = threads[current_tid];
-    if (me && me->state == ThreadState::RUNNING) {
-        // save its context; sigsetjmp returns 0 *now*, and non-zero when we jump back
-        if (sigsetjmp(me->env, 1) == 0) {
-            // Demote RUNNING → READY (unless it blocked or terminated itself in the meantime)
-            me->state = ThreadState::READY;
-            enqueue_ready(current_tid);
-
-            // (3) Pick the next READY thread
-            if (ready_size() == 0) {
-                // no one left → just exit
-                std::exit(0);
-            }
-            int next_tid = dequeue_ready();
-            ThreadControlBlock* next = threads[next_tid];
-            next->state    = ThreadState::RUNNING;
-            current_tid    = next_tid;
-
-	    // A new quantum is starting.
-	    total_quantums++;
-	    threads[next_tid]->quantums++;
-
-            // (4) resume it
-            restore_timer(prev);
-            siglongjmp(next->env, 1);
-            // never returns
+    void switch_to_next(SwitchCause why) {
+      // if we have to save current context...
+      if (why!=SwitchCause::TERMINATE) {
+        if (sigsetjmp(current->env,1)==0) {
+          // move it to appropriate queue
+          if (why==SwitchCause::CYCLE) {
+            current->state = ThreadState::READY;
+            ready_queue.push_back(current);
+          }
+          else if (why==SwitchCause::BLOCK) {
+            blocked_list.push_back(current);
+          }
+          // pick a new one
+          if (ready_queue.empty()) {
+            // no one to run → just keep running the same thread
+            arm_timer();
+            return;
+          }
+          TCB* next = ready_queue.front();
+          ready_queue.pop_front();
+          next->state = ThreadState::RUNNING;
+          current = next;
+          total_quanta++;
+          current->quantum_count++;
+          arm_timer();
+          siglongjmp(current->env,1);
         }
+      } else {
+        // terminated: just pick next
+        delete current;
+        if (ready_queue.empty()) std::exit(0);
+        TCB* next = ready_queue.front();
+        ready_queue.pop_front();
+        next->state = ThreadState::RUNNING;
+        current = next;
+        total_quanta++;
+        current->quantum_count++;
+        arm_timer();
+        siglongjmp(current->env,1);
+      }
     }
 
-    // If we get here, either we returned from a siglongjmp back into this thread,
-    // or the current thread wasn’t in RUNNING state (rare). Just restore mask.
-    restore_timer(prev);
+  public:
+    static ThreadsManager& instance() {
+      static ThreadsManager mgr;
+      return mgr;
+    }
+};
+
+// the trampoline that actually calls the entry point
+static void thread_trampoline() {
+  auto& M = ThreadsManager::instance();
+  // find our TCB by looking at current tid
+  int tid = M.get_tid();
+  // jump into the real function
+  for (;;) {
+    // this never returns
+    throw std::logic_error("should not reach here");
+  }
 }
 
-int uthread_spawn(thread_entry_point entry_point) {
-    if (!entry_point) {
-        fprintf(stderr, "thread library error: null entry_point.\n");
-        return -1;
-    }
-
-    // Block SIGVTALRM around our setup to avoid races.
-    sigset_t prev_mask;
-    block_timer(prev_mask);
-
-    // Check thread limit.
-    if (total_threads >= MAX_THREAD_NUM) {
-        // restore previous mask before returning
-	restore_timer(prev_mask);
-        return -1;
-    }
-
-    // Pick smallest free tid.
-    int tid = -1;
-    for (int i = 0; i < MAX_THREAD_NUM; ++i) {
-        if (threads[i] == nullptr) {
-            tid = i;
-            break;
-        }
-    }
-    if (tid < 0) {
-	restore_timer(prev_mask);
-        return -1;
-    }
-
-    // Allocate TCB and stack.
-    auto* tcb = (ThreadControlBlock*)std::malloc(sizeof(ThreadControlBlock));
-    if (!tcb) {
-        std::perror("malloc");
-        std::exit(1);
-    }
-    void* stk = std::malloc(STACK_SIZE);
-    if (!stk) {
-        std::perror("malloc");
-        std::exit(1);
-    }
-
-    // Initialize TCB fields.
-    tcb->tid = tid;
-    tcb->state = ThreadState::READY;
-    tcb->entry_point = entry_point;
-    tcb->stack = (char*)stk;
-    tcb->sleep_count = 0;
-    tcb->quantums = 0;
-
-    // Capture a baseline context, then patch its SP and PC.
-    if (sigsetjmp(tcb->env, 1) == 0) {
-        address_t sp = (address_t)tcb->stack + STACK_SIZE - sizeof(address_t);
-        address_t pc = (address_t)thread_stub;  // trampoline that calls entry_point+terminate
-
-        tcb->env->__jmpbuf[JB_SP] = translate_address(sp);
-        tcb->env->__jmpbuf[JB_PC] = translate_address(pc);
-    }
-
-    // Register thread in our arrays & data structures.
-    threads[tid] = tcb;
-    ++total_threads;
-    enqueue_ready(tid);
-
-    // Restore the original signal mask.
-    restore_timer(prev_mask);
-
-    return tid;
-}
-
-int uthread_terminate(int tid) {
-    // Block our timer signal so the clean-up is atomic.
-    sigset_t prev;
-    block_timer(prev);
-
-    // Validate tid.
-    if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
-        std::fprintf(stderr, "thread library error: no such tid %d\n", tid);
-	restore_timer(prev);
-        return -1;
-    }
-
-    // If main thread → clean up everything and exit.
-    if (tid == 0) {
-        // free all other threads
-        for (int i = 1; i < MAX_THREAD_NUM; ++i) {
-            if (threads[i]) {
-                std::free(threads[i]->stack);
-                delete threads[i];
-                threads[i] = nullptr;
-            }
-        }
-        std::exit(0);
-    }
-
-    // Otherwise, tear down this one.
-    ThreadControlBlock* victim = threads[tid];
-    // remove from our thread table.
-    threads[tid] = nullptr;
-    --total_threads;
-
-    // free its stack and TCB.
-    std::free(victim->stack);
-    delete victim;
-
-    // Remove tid from the READY queue if it’s there.
-    remove_from_ready(tid);
-
-    // If we’re terminating *another* thread, we’re done.
-    if (tid != current_tid) {
-	restore_timer(prev);
-        return 0;
-    }
-
-    // Else: the current thread is self-terminating → pick the next one.
-    if (ready_size() == 0) {
-        // No runnable threads → exit.
-        std::exit(0);
-    }
-    int next = dequeue_ready();
-    current_tid = next;
-    threads[next]->state = ThreadState::RUNNING;
-
-    // A new quantum is starting.
-    total_quantums++;
-    threads[next]->quantums++;
-
-    // Jump to the next thread’s saved context.
-    siglongjmp(threads[next]->env, 1);
-
+//
+// the C‐style wrappers that call into our manager singleton
+//
+int uthread_init(int q) {
+  try {
+    ThreadsManager::instance().init(q);
     return 0;
+  } catch(...) {
+    return -1;
+  }
 }
-
-//-----------------------------------------------------------
-// uthread_block
-//-----------------------------------------------------------
-int uthread_block(int tid) {
-    // 1) Block timer signal
-    sigset_t prev;
-    block_timer(prev);
-
-    // 2) Validate tid
-    if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
-        std::fprintf(stderr, "thread library error: no such tid %d\n", tid);
-        restore_timer(prev);
-        return -1;
-    }
-    // 3) Cannot block main thread
-    if (tid == 0) {
-        std::fprintf(stderr, "thread library error: cannot block main thread\n");
-        restore_timer(prev);
-        return -1;
-    }
-
-    ThreadControlBlock* tcb = threads[tid];
-    // 4) If already BLOCKED, nothing to do
-    if (tcb->state == ThreadState::BLOCKED) {
-        restore_timer(prev);
-        return 0;
-    }
-
-    // 5) If READY, remove from ready queue
-    if (tcb->state == ThreadState::READY) {
-        remove_from_ready(tid);
-        tcb->state = ThreadState::BLOCKED;
-        restore_timer(prev);
-        return 0;
-    }
-
-    // 6) If RUNNING
-    if (tcb->state == ThreadState::RUNNING) {
-        // a) mark it blocked
-        tcb->state = ThreadState::BLOCKED;
-        // b) pick next to run
-        if (ready_size() == 0) {
-            // no other runnable threads → exit
-            std::exit(0);
-        }
-        int next = dequeue_ready();
-        ThreadControlBlock* next_tcb = threads[next];
-        next_tcb->state = ThreadState::RUNNING;
-        current_tid = next;
-
-	// A new quantum is starting.
-	total_quantums++;
-	threads[next]->quantums++;
-
-        // c) context switch
-        siglongjmp(next_tcb->env, 1);
-        // never returns
-    }
-
-    // unreachable, but for form:
-    restore_timer(prev);
-    return 0;
-}
-
-int uthread_resume(int tid) {
-    // Block SIGVTALRM so our operations are atomic.
-    sigset_t prev_mask;
-    block_timer(prev_mask);
-
-    // Validate tid
-    if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
-        std::fprintf(stderr, "thread library error: no such tid %d\n", tid);
-        restore_timer(prev_mask);
-        return -1;
-    }
-
-    auto* tcb = threads[tid];
-
-    // Only move BLOCKED → READY; everything else is a no-op.
-    if (tcb->state == ThreadState::BLOCKED) {
-        tcb->state = ThreadState::READY;
-        enqueue_ready(tid);
-    }
-
-    // Unblock and return
-    restore_timer(prev_mask);
-    return 0;
-}
-
-int uthread_sleep(int num_quantums) {
-    // You may not sleep the main thread.
-    if (current_tid == 0) {
-        std::fprintf(stderr, "thread library error: main thread cannot sleep\n");
-        return -1;
-    }
-
-    if (num_quantums <= 0) {
-        std::fprintf(stderr, "thread library error: sleep_quantums must be > 0\n");
-        return -1;
-    }
-
-    // Block SIGVTALRM so we aren’t preempted halfway.
-    sigset_t prev;
-    block_timer(prev);
-
-    // Grab the TCB of the thread that called us.
-    ThreadControlBlock* me = threads[current_tid];
-
-    // Mark it to sleep for that many quantums, then BLOCK it.
-    me->sleep_count = num_quantums;
-    me->state = ThreadState::BLOCKED;
-
-    // Immediately schedule someone else.
-    if (ready_size() == 0) {
-        // No one else to run → exit.
-        std::exit(0);
-    }
-    int next = dequeue_ready();
-    ThreadControlBlock* nt = threads[next];
-    nt->state = ThreadState::RUNNING;
-    current_tid = next;
-    
-    total_quantums++;
-    threads[next]->quantums++;
-
-    // Unblock the timer and switch context.
-    restore_timer(prev);
-    siglongjmp(nt->env, 1);
-
-    // Never reached.
-    return 0;
-}
-
-int uthread_get_tid() {
-    return current_tid;
-}
-
-int uthread_get_total_quantums() {
-    return total_quantums;
-}
-
-int uthread_get_quantums(int tid) {
-    // Invalid tid?
-    if (tid < 0 || tid >= MAX_THREAD_NUM || threads[tid] == nullptr) {
-        std::fprintf(stderr, "thread library error: no such tid %d\n", tid);
-        return -1;
-    }
-    return threads[tid]->quantums;
-}
+int uthread_spawn(thread_entry_point e) { return ThreadsManager::instance().spawn(e); }
+int uthread_terminate(int t)        { return ThreadsManager::instance().terminate(t); }
+int uthread_block(int t)            { return ThreadsManager::instance().block(t); }
+int uthread_resume(int t)           { return ThreadsManager::instance().resume(t); }
+int uthread_sleep(int q)            { return ThreadsManager::instance().sleep(q); }
+int uthread_get_tid()               { return ThreadsManager::instance().get_tid(); }
+int uthread_get_total_quantums()    { return ThreadsManager::instance().get_total(); }
+int uthread_get_quantums(int t)     { return ThreadsManager::instance().get_quantum(t); }
