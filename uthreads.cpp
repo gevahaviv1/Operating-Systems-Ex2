@@ -63,16 +63,23 @@ struct TCB {
             uthread_terminate(tid);
         }
         // compute new SP and PC into env
-        address_t sp = (address_t)stack + STACK_SIZE - sizeof(address_t);
-        address_t pc = (address_t)thread_trampoline;
-        // platform-specific encoding
-        env->__jmpbuf[JB_SP] = rot_xor(sp);
-        env->__jmpbuf[JB_PC] = rot_xor(pc);
-        sigemptyset(&env->__saved_mask);
+
+        if (entry){
+            address_t sp = (address_t) stack + STACK_SIZE - sizeof(address_t);
+            address_t pc = (address_t) thread_trampoline;
+            // platform-specific encoding
+            env->__jmpbuf[JB_SP] = rot_xor(sp);
+            env->__jmpbuf[1] = rot_xor(sp);
+            env->__jmpbuf[JB_PC] = rot_xor(pc);
+            sigemptyset(&env->__saved_mask);
+        }
     }
 
     ~TCB() {
-        delete[] stack;
+        if (stack) {
+            delete[] stack;
+            stack = nullptr;
+        }
     }
 
     // cheap obfuscation of address so the kernel/jmpbuf trust it
@@ -242,7 +249,7 @@ class ThreadsManager {
   private:
     void install_timer_handler() {
       struct sigaction sa{};
-      sa.sa_handler = +[](int){ ThreadsManager::instance().on_timer(); };
+      sa.sa_handler = +[](int){ ThreadsManager::instance().on_timer(0); };
       sigaction(SIGVTALRM, &sa, nullptr);
     }
 
@@ -264,26 +271,25 @@ class ThreadsManager {
     }
 
     void cleanup_all() {
-      delete current;
-      for (auto* t: ready_queue)  delete t;
-      for (auto* t: blocked_list) delete t;
+ /*     if(current) {
+          delete current;
+          current = nullptr;
+      }*/
+
+      for (auto* t: ready_queue){
+          if(t) {delete t;}
+      }
+      ready_queue.clear();
+
+      for (auto* t: blocked_list) {
+          if(t) {delete t;}
+      }
+      blocked_list.clear();
     }
 
     // called on each SIGVTALRM
-    void on_timer() {
+    void on_timer(int sig) {
       SigBlocker block;
-
-      // decrement sleepers & wake up
-      for (auto it = blocked_list.begin(); it!=blocked_list.end();) {
-        TCB* t = *it;
-        if (t->sleep_quanta>0 && --t->sleep_quanta==0 && t->state==ThreadState::BLOCKED){
-          t->state = ThreadState::READY;
-          ready_queue.push_back(t);
-          it = blocked_list.erase(it);
-          continue;
-        }
-        ++it;
-      }
 
       // preempt current if it's still RUNNING
       if (current->state==ThreadState::RUNNING) {
@@ -292,6 +298,7 @@ class ThreadsManager {
     }
 
     void switch_to_next(SwitchCause why) {
+      SigBlocker block;
       // if we have to save current context...
       if (why!=SwitchCause::TERMINATE) {
         if (sigsetjmp(current->env,1)==0) {
@@ -315,12 +322,25 @@ class ThreadsManager {
           current = next;
           total_quanta++;
           current->quantum_count++;
+
+          // decrement sleepers & wake up
+          for (auto it = blocked_list.begin(); it!=blocked_list.end();) {
+              TCB* t = *it;
+              if (t->sleep_quanta>0 && --t->sleep_quanta==0 && t->state==ThreadState::BLOCKED){
+                  t->state = ThreadState::READY;
+                  ready_queue.push_back(t);
+                  it = blocked_list.erase(it);
+                  continue;
+              }
+              ++it;
+          }
+
           arm_timer();
           siglongjmp(current->env,1);
         }
       } else {
         // terminated: just pick next
-        delete current;
+
         if (ready_queue.empty()) std::exit(0);
         TCB* next = ready_queue.front();
         ready_queue.pop_front();
